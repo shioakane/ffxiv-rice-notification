@@ -1,0 +1,666 @@
+#!/usr/bin/env python
+# -*- coding: utf-8 -*-
+"""
+FF14 绝欧米茄老板队招募监控 (v2)
+- 基于正则的智能"米"关键词检测（参考 is_rice.py）
+- 多级 Windows 通知（MessageBox 保底，一定弹窗）
+- 调用详情 API 获取 slots 职业信息，格式化输出
+"""
+import sys
+import os
+import re
+import unicodedata
+import time
+import json
+import ctypes
+import logging
+import threading
+import winsound
+from pathlib import Path
+from datetime import datetime
+from typing import Set, List, Dict, Any, Optional
+
+import requests
+
+# 同目录导入
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from config import (
+    API_URL, DETAIL_API_URL, PER_PAGE, DUTIES, POLL_INTERVAL,
+    USER_AGENT, CHINESE_DCS,
+    SEEN_FILE, LOG_FILE, PLAY_SOUND,
+    FETCH_DETAIL_SLOTS,
+    BARK_GROUP, BARK_SOUND, BARK_RETRY,
+    NOTIFY_BARK, NOTIFY_PC,
+    REPEAT_NOTIFY, REPEAT_NOTIFY_MINUTES,
+)
+
+# ========== 日志配置 ==========
+SCRIPT_DIR = Path(__file__).parent
+LOG_PATH = SCRIPT_DIR / LOG_FILE
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(message)s",
+    handlers=[
+        logging.FileHandler(str(LOG_PATH), encoding="utf-8"),
+        logging.StreamHandler(sys.stdout),
+    ],
+)
+logger = logging.getLogger("rice_monitor")
+
+
+# ========== 职业 ID 映射 ==========
+JOB_MAP = {
+    19: "骑士/PLD", 21: "战士/WAR", 32: "暗骑/DRK", 37: "枪刃/GNB",
+    24: "白魔/WHM", 28: "学者/SCH", 33: "占星/AST", 40: "贤者/SGE",
+    38: "舞者/DNC", 31: "机工/MCH", 23: "诗人/BRD",
+    27: "召唤/SMN", 30: "黑魔/BLM", 35: "赤魔/RDM",
+    42: "绘灵/PCT", 39: "钐镰/RPR", 34: "武士/SAM",
+    25: "黑骑/DRG", 22: "忍者/NIN", 20: "武僧/MNK",
+    41: "绝枪/SAG",
+    6: "白魔/WHM", 26: "学者/SCH",
+}
+ROLE_MAP = {0: "自由", 1: "T", 2: "奶", 3: "DPS"}
+
+
+# ========== "米"检测逻辑（v2.1，2026-11-17 样本外验证复测，来源见 rice_regex/v2_1.py） ==========
+STRONG_V2 = [
+    "时薪", "小時薪", "每小时", "每小時",
+    "全黑", "全需", "全贪", "黑CD", "黑cd",
+    "老板躺", "老闆躺", "躺黑", "后躺", "後躺",
+    "过本结", "过立结", "过本結", "過本結", "搞转", "搞轉",
+    "郭立姐", "郭丽姐", "郭立姊", "郭立杰",   # v2.1: 补同音变体 郭立杰
+    "搞扣", "搞赔", "搞賠",
+    "代打", "代练", "代練",
+    # 新增强信号
+    "立结",            # 覆盖 过立结/过本立结/来人立结/果粒结
+    "低保", "底薪",    # 保底工资 = 付费队
+]
+# 从强关键词降级：老板队/老闆隊/老板刷 -> 见 BOSS_WORDS(需组合)；赔钱/扣钱/扣工资 -> 见 DEDUCT_CTX(需组合)
+# 删除：0时/0時（子串误伤 1400时=14:00，且本批 13 次命中无独立贡献）
+
+# 价格 token: 数字+单位（万/W/k/K/千，含 kw 组合），或 数字/CD|饭|小时 形式，或 裸数字>=100（仅用于雇佣/狗组合）
+PRICE_UNIT = re.compile(r'\d{1,4}\s*[kK千]?[wW万萬]|\d{1,4}\s*[kK千](?![pP])')
+# v2.1: 补按 CD 裸价分支 \d{3,4} + (一|1)?CD（1600 1CD / 1600一cd / 2000cd；3CD陪练费是 1 位数，不会误伤）
+# v2.1 复测补：分支 2 的 1 改为 (?:一|1)（2500w 一CD）
+PRICE_PER_CD = re.compile(r'(\d{1,4})\s*[kK千]?[wW万萬]?\s*\d?\s*/\s*[cC][dD]|(\d{1,4})\s*[wW万萬K千]\s*(?:一|1)\s*[cC][dD]|(\d{1,4})\s*[wW万萬K千]\s*打(?:一|1)(?:个)?\s*[cC][dD]|(\d{3,4})\s*(?:一|1)?\s*[cC][dD]')
+# v2.1: 补按饭裸价 (一|1)飯 + 裸数 2-3 位（1飯60）
+PRICE_PER_MEAL = re.compile(r'(?:一|1)\s*[飯饭]\s*\d+\s*[wW万萬]|\d+\s*[wW万萬]\s*/\s*(?:一|1)\s*[飯饭]|\d{2,4}\s*/\s*[飯饭]|(?:一|1)\s*[飯饭]\s*\d{2,3}(?!\d)')
+PRICE_PER_CLEAR = re.compile(r'(?:通关|通關|过本|過本|渡劫)\s*\d+\s*[wW万萬]')
+# v2.1 时薪改动：
+#  - /h 分支前瞻 (?![a-zA-Z0-9]) -> (?![0-9])：去空格后 H 后跟字母仍是时薪（700/h d3、1000/h p51），H2 这类职业码仍被挡住
+#  - 新增 /1h 分支（1000/1h）；新增 Xw 1h 分支（1200w1h、1000w 1h，数字 2-4 位且后不跟数字，防 p51h 这类粘连）
+#  - 新增裸数字打一小时分支（1000打一小时，数字 3-4 位，防 P5打一小时这类阶段码）
+#  - 新增裸数字一小时分支（1000一小时，数字 3-4 位，防 P5一小时）
+#  - 新增 Xw打半小时分支（500w打半小时）
+#  - 1kw h 分支前瞻同样放宽到 (?![0-9])
+HOURLY_V2 = re.compile(
+    r'(\d{1,4})\s*[wW万萬kK千]?\s*/\s*(?:[hH](?![0-9])|小时|小時)'                   # 1000/h, 1000W/H, 400W/1小时(见下)
+    r'|(\d{1,4})\s*[wW万萬kK千]?\s*/\s*1\s*(?:小时|小時)'                    # 400W/1小时
+    r'|(\d{1,4})\s*[wW万萬kK千]?\s*/\s*1\s*[hH](?![0-9])'                   # 1000/1h
+    r'|(\d{1,4})\s*[wW万萬K千]\s*.?.?(?:一|1)\s*(?:小时|小時)'             # 500w一小时/1200W黄金一小时
+    r'|(\d{1,4})\s*(?:[kK千][wW万萬]?|[wW万萬K千])\s*打(?:一|1)(?:个)?(?:半\s*)?(?:小时|小時|[hH])'  # 1000w打一小时/1kw打一小时/1300w打一个半h
+    r'|(\d{1,4})\s*[wW万萬]\s*半小时'                                       # 500w半小时/200w半小时
+    r'|(\d{1,4})\s*[wW万萬kK千]\s*打\s*半\s*(?:小时|小時|[hH])'             # 500w打半小时
+    r'|(\d{3,4})\s*打(?:一|1)(?:个)?(?:半\s*)?(?:小时|小時|[hH])'           # 1000打一小时（裸数字，3-4 位）
+    r'|(\d{3,4})\s*(?:一|1)\s*(?:小时|小時)'                               # 1000一小时（裸数字，3-4 位）
+    r'|(\d{2,4})(?!\d)\s*[wW万萬kK千]?\s*1\s*[hH](?![0-9])'                # 1200w1h / 1000w 1h
+    r'|(\d{1,4})\s*[kK千][wW万]?\s*[hH](?![0-9])'                          # 1kw h
+    r'|(\d{1,4})\s*[wW万萬]?\s*时薪'                                        # 1000w时薪(已在强关键词,兜底)
+)
+# 人数拆分：要求前后不是数字/= /pP（排除 P2P3 阶段、7=1+P2 合并）
+# v2.1: 改在未去空格原文上匹配（见 is_rice_party），解决 7p1 10+ 被杀（F6）与 D4P3/D2P3 幻拆分（P2）
+SPLIT_V2 = re.compile(r'(?<![\d=pP])[1-7][pP][1-7](?![\d])')
+# 价格+次数：要求带单位，或首数字>=100（排除 25+7 副职、8+33 灭散、:30+1 时间）
+PRICE_PLUS_RUN_V2 = re.compile(r'(?:^|[^\d:])(\d{1,4})\s*([kK千]?[wW万萬]?)\s*[+＋]\s*(\d{1,2})(?:把|次|局)?')
+CLEAR_V2 = ["过本", "過本", "渡劫", "通关", "通關", "包过", "包過", "复建"]  # 删除 清CD；新增 复建（仅组合用）
+BOSS_WORDS = ["老板", "老闆", "打工", "躺", "老板队", "老闆隊", "老板刷"]
+HIRE_WORDS = ["陪练", "陪練", "傭兵", "佣兵", "代打", "代练", "代練", "代班"]
+DEDUCT_STRONG = ["搞扣", "搞赔", "搞賠"]
+DEDUCT_CTX = ["扣工资", "扣錢", "扣钱", "赔钱", "賠錢"]
+STAGE_DEDUCT_V2 = re.compile(
+    r'(?:[pP]?\s*)?([1-9])\s*[kK扣]\s*(?:[pP]?\s*)?([1-9])\s*[pP赔賠](?!\s*/\s*[cC][dD])'
+    r'|(?:[pP]\s*)?([1-9])\s*扣\s*(?:[pP]\s*)?([1-9])\s*赔')
+REQ_STRIP = [
+    re.compile(r'过本(经验|记录|配置)'),
+    re.compile(r'(内含|内置|内有|已有)[^，,。]{0,8}?(过本|通關|通关)'),
+    re.compile(r'(要求|需要|需)[^，,。]{0,12}?(过本|通關|通关|渡劫)'),
+]
+# v2.1: 吐槽语境标记（仅用于 veto 低保/底薪/时薪类强关键词，不降级这些词本身——
+# “绝欧低保7=d2”这类真阳性无招/来字，全靠低保命中，降级会丢）
+RANT_SENSITIVE = ["低保", "底薪", "时薪", "小時薪", "每小时", "每小時"]
+RANT_RE = re.compile(r'骗[^，,。]{0,8}?(不给|不給)')
+
+def _norm(desc):
+    return unicodedata.normalize('NFKC', desc or '')
+def _flat(desc):
+    return _norm(desc).upper().replace(' ', '').replace('　', '')
+def _has_rant(raw):
+    t = _flat(raw)
+    if "不想活了" in t or "藏亲友" in t: return True
+    if RANT_RE.search(t): return True
+    return False
+
+def _has_price_unit(text):
+    return bool(PRICE_UNIT.search(text))
+def _has_price_plus_run(text):
+    m = PRICE_PLUS_RUN_V2.search(text)
+    if not m: return False
+    num, unit = int(m.group(1)), m.group(2)
+    return bool(unit) or num >= 100
+TIME_STRIP = [re.compile(r'\d{1,2}:\d{2}'), re.compile(r'\d{3,4}\s*-\s*\d{3,4}'), re.compile(r'\d{7,}')]
+BARE_NUM = re.compile(r'(?<![A-Za-z0-9+])\d{3,4}(?![A-Za-z0-9:])')
+def _bare_num(win):
+    win2 = win
+    for pat in TIME_STRIP: win2 = pat.sub('', win2)
+    for m in BARE_NUM.finditer(win2):
+        if re.fullmatch(r'3+', m.group(0)): continue   # 33/333 = 灭散次数
+        if m.group(0) == '1211': continue              # 1211 = 站位代号
+        # v2.1: 33/333 开头且后跟 + 的是灭散次数 + 招人数粘连（如 335+ = 33 + 5+），不是价格
+        if m.group(0).startswith('33') and win2[m.end():m.end()+1] == '+': continue
+        return True
+    return False
+def _hire_with_price(raw):
+    t = _flat(raw)
+    for pat in TIME_STRIP: t = pat.sub('', t)   # 先去掉 1900-2000 / 21:00 等时间，避免占窗口
+    for w in HIRE_WORDS:
+        for m in re.finditer(re.escape(w), t):
+            lo, hi = max(0, m.start()-16), m.end()+16   # v2.1: 窗口 ±12 -> ±16（1000 离陪练 14 字被截断）
+            win = t[lo:hi]
+            if (PRICE_UNIT.search(win) or PRICE_PER_CD.search(win) or PRICE_PER_MEAL.search(win)
+                    or _bare_num(win) or re.search(r'\d+\s*/\s*(?:飯|CD|小时|小時)', win)
+                    or re.search(r'\d{3,4}\s*[hH](?![A-Za-z0-9])', win)):  # 3501h = 350/1h（仅雇佣语境）
+                return True
+    return False
+def _short_hire_with_price(raw):
+    # v2.1: 裸数字>=100 + 陪（未写全“陪练”），如 900陪武僧渡劫
+    t = _flat(raw)
+    return bool(re.search(r'\d{3,4}\s*陪(?![练練])', t))
+def _hire_negotiable(raw):
+    t = _flat(raw)
+    return any(w in t for w in HIRE_WORDS) and bool(re.search(r'价格(?:可议|可談|可谈|面议|详谈)', t))
+def _dog_with_price(raw):
+    t = _flat(raw)
+    if re.search(r'狗\s*[+＋]\s*\d+', t): return True   # 狗+50 / 狗＋100
+    for m in re.finditer('狗', t):
+        lo, hi = max(0, m.start()-10), m.end()+10
+        win = t[lo:hi]
+        if PRICE_UNIT.search(win) or _bare_num(win):
+            return True
+    return False
+def _photo_entry_with_price(raw):
+    # v2.1（暂定窄规则，待更多样本再固化）: 价格 + 一个人 + 进本/拍照，如 20万一个人进本拍照
+    t = _flat(raw)
+    if not re.search(r'\d{1,4}\s*[W万萬]\s*(?:一|1)?\s*个\s*人', t):
+        return False
+    return ('进本' in t) or ('拍照' in t)
+def _looks_like_time(num):
+    # v2.1: 裸数字读作时间时不是价格（1800=18:00、1030=10:30、900=9:00；3000=30:00 不是时间）
+    if len(num) == 4:
+        hh, mm = int(num[:2]), int(num[2:])
+    elif len(num) == 3:
+        hh, mm = int(num[0]), int(num[1:])
+    else:
+        return False
+    return 0 <= hh <= 23 and 0 <= mm <= 59
+def _price_recruit(raw):
+    # 裸价 + 招/来 + 职业：1500w来d3；排除 “拿100w”（拿=收钱非付钱）
+    t = _flat(raw)
+    if '拿' in t and re.search(r'拿\d+\s*[W万萬]', t):
+        return False
+    job = r'(?:D\d|H\d|MT|ST|非\w{0,2}|[A-Z]{1,3})'
+    # v2.1: 招/来后允许“一/1/一位”（3000招一H2、招一位H1）
+    if re.search(r'\d{1,4}\s*[W万萬K千]\s*(?:来|招)\s*(?:一|1)?\s*(?:位)?\s*' + job, t):
+        return True
+    # v2.1 复测补：裸价（>=100，无单位）+ 招/来 + 职业（3000招一H2学者打两小时）；
+    # 但裸数字读作时间时除外（1800招非黑d1：1800=18:00，非价格）
+    m = re.search(r'(\d{3,4})\s*(?:来|招)\s*(?:一|1)?\s*(?:位)?\s*' + job, t)
+    if m and not _looks_like_time(m.group(1)):
+        return True
+    # v2.1: 尾价——招/来 + 职业 … 价格在后（如 +1，ymd，来d3。300w）
+    if re.search(r'(?:来|招)\s*' + job + r'[^\d]{0,16}?\d{2,4}\s*[W万萬K千]', t):
+        return True
+    return False
+
+CHATTER = ["刚刚", "少给", "少給"]
+def is_rice_party(desc):
+    if not desc: return False
+    if any(c in desc for c in CHATTER): return False   # 讨薪/纠纷闲聊，非招募
+    raw = _norm(desc)
+    text = _flat(raw)
+    strong_hits = [k for k in STRONG_V2 if k.upper() in text]
+    if strong_hits:
+        # v2.1: 命中的强关键词若全是低保/时薪类且是吐槽语境，则跳过强关键词触发（其他规则仍可命中）
+        if not (_has_rant(raw) and all(k in RANT_SENSITIVE for k in strong_hits)):
+            return True
+    if HOURLY_V2.search(text): return True
+    if PRICE_PER_CD.search(text) or PRICE_PER_MEAL.search(text) or PRICE_PER_CLEAR.search(text): return True
+    if _has_price_plus_run(text): return True
+    if _hire_with_price(raw) or _short_hire_with_price(raw) or _hire_negotiable(raw) or _dog_with_price(raw): return True
+    if _photo_entry_with_price(raw): return True
+    if _price_recruit(raw): return True
+    has_price = _has_price_unit(text)
+    # 过本类信号：先去掉“要求/内含过本经验/记录”类表述
+    t2 = text
+    for pat in REQ_STRIP: t2 = pat.sub('', t2)
+    has_clear = any(k.upper() in t2 for k in CLEAR_V2)
+    has_boss = any(k in text for k in BOSS_WORDS)
+    # v2.1: 拆分在未去空格原文上匹配（raw 保留空格；flat 会把 D4 P3 粘成 D4P3、把 7p1 10+ 粘成 7P110+）
+    has_split = bool(SPLIT_V2.search(raw))
+    has_deduct = any(k.upper() in text for k in DEDUCT_STRONG) or bool(STAGE_DEDUCT_V2.search(text))
+    has_deduct_ctx = any(k.upper() in text for k in DEDUCT_CTX)
+    if has_deduct: return True
+    if has_deduct_ctx and has_price: return True
+    if has_split and (has_price or has_clear): return True
+    if has_price and has_clear: return True
+    if has_price and has_boss: return True
+    return False
+
+def get_rice_reason(desc: str) -> List[str]:
+    """返回匹配到的原因列表（v2.1 规则，用于日志展示，与 is_rice_party 同口径）。"""
+    if not desc:
+        return []
+    raw = _norm(desc)
+    text = _flat(raw)
+    reasons = []
+    strong_hits = [k for k in STRONG_V2 if k.upper() in text]
+    if strong_hits:
+        # v2.1: 吐槽语境 + 全是低保/时薪类时，强关键词不触发（也不报原因）
+        if not (_has_rant(raw) and all(k in RANT_SENSITIVE for k in strong_hits)):
+            reasons.append(f"强关键词={strong_hits}")
+    m = HOURLY_V2.search(text)
+    if m:
+        reasons.append(f"时薪={m.group()}")
+    for name, pat in (("按CD", PRICE_PER_CD), ("按饭", PRICE_PER_MEAL), ("按通关", PRICE_PER_CLEAR)):
+        mm = pat.search(text)
+        if mm:
+            reasons.append(f"{name}={mm.group()}")
+    if _has_price_plus_run(text):
+        reasons.append(f"价格+次数={PRICE_PLUS_RUN_V2.search(text).group()}")
+    if _hire_with_price(raw):
+        reasons.append("雇佣+价=陪练/佣兵/代打/代班+价格")
+    if _short_hire_with_price(raw):
+        reasons.append("陪简写+价=裸数字+陪")
+    if _hire_negotiable(raw):
+        reasons.append("雇佣+议价=价格可议")
+    if _dog_with_price(raw):
+        reasons.append("狗+价")
+    if _photo_entry_with_price(raw):
+        reasons.append("付费进本拍照")
+    if _price_recruit(raw):
+        reasons.append("裸价招募")
+    if _has_price_unit(text):
+        reasons.append(f"价格={PRICE_UNIT.search(text).group()}")
+    t2 = text
+    for pat in REQ_STRIP:
+        t2 = pat.sub('', t2)
+    clear_hits = [k for k in CLEAR_V2 if k.upper() in t2]
+    if clear_hits:
+        reasons.append(f"过本={clear_hits}")
+    boss_hits = [k for k in BOSS_WORDS if k in text]
+    if boss_hits:
+        reasons.append(f"老板/打工={boss_hits}")
+    sm = SPLIT_V2.search(raw)  # v2.1: 拆分在未去空格原文上匹配
+    if sm:
+        reasons.append(f"人数拆分={sm.group()}")
+    if any(k.upper() in text for k in DEDUCT_STRONG) or STAGE_DEDUCT_V2.search(text):
+        reasons.append("扣赔机制")
+    return reasons
+
+# ========== 工具函数 ==========
+def load_seen() -> Dict[int, float]:
+    """加载已通知过的招募 ID -> 上次提醒时间（epoch 秒）。
+    兼容旧格式：旧版存的是纯 ID 列表，读到后按当前时间戳转换
+    （升级后旧招募会在间隔到期后才再次提醒，不会一启动就刷屏）。"""
+    path = SCRIPT_DIR / SEEN_FILE
+    if not path.exists():
+        return {}
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except Exception as e:
+        logger.warning(f"读取 seen 文件失败: {e}，重新开始")
+        return {}
+    if isinstance(data, dict):
+        # 新格式 {id: 上次提醒时间}
+        return {int(k): float(v) for k, v in data.items()}
+    if isinstance(data, list):
+        # 旧格式 [id, id, ...]，按当前时间转换
+        now = time.time()
+        return {int(i): now for i in data}
+    return {}
+
+
+def save_seen(seen: Dict[int, float]):
+    """保存已通知过的招募 ID 及上次提醒时间（只保留最近提醒的 2000 个）"""
+    path = SCRIPT_DIR / SEEN_FILE
+    recent = dict(sorted(seen.items(), key=lambda kv: kv[1])[-2000:])
+    path.write_text(json.dumps(recent), encoding="utf-8")
+
+
+def should_notify(lid: int, seen: Dict[int, float], now: float) -> bool:
+    """这条招募现在该不该提醒：没提醒过 → 提醒；提醒过且开关开了、
+    距上次提醒已超过 REPEAT_NOTIFY_MINUTES 分钟 → 再提醒一次。"""
+    last = seen.get(lid)
+    if last is None:
+        return True
+    if not REPEAT_NOTIFY:
+        return False
+    return (now - last) >= REPEAT_NOTIFY_MINUTES * 60
+
+
+def fetch_listings(duties: List[int]) -> List[Dict[str, Any]]:
+    """从 xivpf API 获取招募列表"""
+    params = {
+        "per_page": PER_PAGE,
+        "duty": ",".join(map(str, duties)),
+    }
+    headers = {"User-Agent": USER_AGENT}
+    try:
+        r = requests.get(API_URL, params=params, headers=headers, timeout=15)
+        r.raise_for_status()
+        data = r.json()
+        return data.get("data", [])
+    except requests.exceptions.Timeout:
+        logger.error("API 请求超时")
+        return []
+    except requests.exceptions.ConnectionError as e:
+        logger.error(f"API 连接失败: {e}")
+        return []
+    except Exception as e:
+        logger.error(f"API 请求异常: {e}")
+        return []
+
+
+def fetch_detail(listing_id: int) -> Optional[Dict[str, Any]]:
+    """调用详情 API 获取 slots 信息"""
+    url = DETAIL_API_URL.format(id=listing_id)
+    headers = {"User-Agent": USER_AGENT}
+    try:
+        r = requests.get(url, headers=headers, timeout=10)
+        r.raise_for_status()
+        return r.json()
+    except Exception as e:
+        logger.warning(f"获取详情失败 id={listing_id}: {e}")
+        return None
+
+
+def format_slots(slots: List[Dict]) -> str:
+    """格式化 slots 数组为可读字符串"""
+    if not slots:
+        return "（无 slots 信息）"
+
+    filled_jobs = []
+    open_slots = []
+
+    for s in slots:
+        if s.get("filled"):
+            job = s.get("job", "?")
+            role = ROLE_MAP.get(s.get("role_id", 0), s.get("role", "?"))
+            filled_jobs.append(f"{job}({role})")
+        else:
+            role = ROLE_MAP.get(s.get("role_id", 0), s.get("role") or "自由")
+            # 空位的 job 字段是可接受职业列表
+            acceptable = s.get("job", "")
+            if acceptable and len(acceptable) > 15:
+                acceptable = acceptable[:15] + "…"
+            open_slots.append(f"空位({role}{'/' + acceptable if acceptable else ''})")
+
+    parts = []
+    if filled_jobs:
+        parts.append(f"已有: {', '.join(filled_jobs)}")
+    if open_slots:
+        parts.append(f"招: {', '.join(open_slots)}")
+
+    return " | ".join(parts) if parts else "（无 slots 信息）"
+
+
+def format_bark_body(item: Dict[str, Any]) -> str:
+    """手机推送正文（三行，短格式）：
+    第 1 行：描述
+    第 2 行：大区-队长@服务器 人数
+    第 3 行：接收时间 + 剩余时间
+    """
+    dc = item.get("datacenter", "")
+    name = item.get("name", "")
+    home = item.get("home_world", "")
+    desc = (item.get("description", "") or "").strip()
+    slots_filled = item.get("slots_filled", 0)
+    slots_available = item.get("slots_available", 0)
+    time_left = item.get("time_left", 0)
+    mins_left = int(time_left / 60) if time_left else 0
+    received = datetime.now().strftime("%m-%d %H:%M")
+    lines = [
+        desc,
+        f"{dc}-{name}@{home} {slots_filled}/{slots_available}",
+        f"接收 {received}｜剩余约 {mins_left} 分钟",
+    ]
+    return "\n".join(lines)
+
+
+def format_listing_detail(item: Dict[str, Any], detail: Optional[Dict]) -> str:
+    """格式化招募信息为完整通知消息（含 slots）"""
+    duty = item.get("duty", "")
+    dc = item.get("datacenter", "")
+    name = item.get("name", "")
+    home = item.get("home_world", "")
+    desc = item.get("description", "") or ""
+    slots_filled = item.get("slots_filled", 0)
+    slots_available = item.get("slots_available", 0)
+    time_left = item.get("time_left", 0)
+    mins_left = int(time_left / 60) if time_left else 0
+
+    lines = [
+        f"副本: {duty}",
+        f"大区: {dc} | 队长: {name}@{home}",
+        f"人数: {slots_filled}/{slots_available} | 剩余: {mins_left}分钟",
+        f"描述: {desc}",
+    ]
+
+    if detail and FETCH_DETAIL_SLOTS:
+        slots = detail.get("slots", [])
+        if slots:
+            lines.append(f"阵容: {format_slots(slots)}")
+
+    return "\n".join(lines)
+
+
+def format_listing_console(item: Dict[str, Any], detail: Optional[Dict]) -> str:
+    """格式化招募信息为控制台日志"""
+    lid = item.get("id", "")
+    duty = item.get("duty", "")
+    dc = item.get("datacenter", "")
+    name = item.get("name", "")
+    home = item.get("home_world", "")
+    desc = item.get("description", "") or ""
+    reasons = get_rice_reason(desc)
+
+    msg = (
+        f"[新老板队] id={lid} | {duty}({dc}) | "
+        f"{name}@{home} | 米={reasons}\n"
+        f"  描述: {desc[:120]}"
+    )
+
+    if detail and FETCH_DETAIL_SLOTS:
+        slots = detail.get("slots", [])
+        if slots:
+            msg += f"\n  阵容: {format_slots(slots)}"
+
+    return msg
+
+
+# ========== 通知 ==========
+def play_alert_sound():
+    """播放系统提示音（连续三声）"""
+    if not PLAY_SOUND:
+        return
+    try:
+        for _ in range(3):
+            winsound.MessageBeep(winsound.MB_ICONEXCLAMATION)
+            time.sleep(0.15)
+    except Exception:
+        pass
+
+
+def show_msgbox(title: str, message: str):
+    """非阻塞 MessageBox（最可靠的通知方式，一定弹窗）"""
+    MB_ICONEXCLAMATION = 0x30
+    MB_TOPMOST = 0x40000
+    MB_SYSTEMMODAL = 0x1000
+    # 截断消息（MessageBox 有长度限制）
+    if len(message) > 500:
+        message = message[:500] + "..."
+    t = threading.Thread(target=lambda: ctypes.windll.user32.MessageBoxW(
+        0, message, title, MB_ICONEXCLAMATION | MB_TOPMOST | MB_SYSTEMMODAL
+    ))
+    t.daemon = True
+    t.start()
+
+
+def notify(title: str, message: str,
+           bark_title: Optional[str] = None, bark_body: Optional[str] = None):
+    """发送通知。PC 通知和手机通知是两个独立开关（config 里的 NOTIFY_PC / NOTIFY_BARK），
+    可多选。bark_title / bark_body 不传时，手机推送沿用 PC 版的标题和正文。"""
+    logger.info(f"通知: {title}")
+
+    # ---- PC 通知：弹窗 + 提示音 + toast ----
+    if NOTIFY_PC:
+        # 播放提示音
+        play_alert_sound()
+        # MessageBox 弹窗（最可靠）
+        show_msgbox(title, message)
+
+        # 同时尝试 plyer toast（如果 Windows 通知中心开着就能看到）
+        try:
+            from plyer import notification as plyer_notif
+            plyer_notif.notify(
+                title=title,
+                message=message[:200],
+                app_name="FF14 Rice Monitor",
+                timeout=10,
+            )
+        except Exception:
+            pass
+
+    # ---- 手机通知：Bark 推送到 iPhone（电脑当 server，手机只做接收）----
+    if NOTIFY_BARK:
+        try:
+            from bark import push_bark, load_key
+            key = load_key()
+            if not key:
+                logger.warning("Bark 未配置 key，跳过手机推送（把 key 填到 config.py 的 BARK_KEY，或新建 bark.key 文件）")
+            else:
+                ok, resp = push_bark(key, bark_title or title, bark_body or message,
+                                     group=BARK_GROUP, sound=BARK_SOUND,
+                                     retries=BARK_RETRY)
+                if ok:
+                    logger.info(f"Bark 推送成功: {resp}")
+                else:
+                    logger.error(f"Bark 推送失败: {resp}")
+        except Exception as e:
+            logger.error(f"Bark 推送异常: {e}")
+
+
+# ========== 主循环 ==========
+def main():
+    # 初始化
+    seen = load_seen()
+    logger.info("=" * 60)
+    logger.info("FF14 绝欧米茄老板队监控 v2 启动")
+    logger.info(f"  副本 ID: {DUTIES}")
+    logger.info(f"  轮询间隔: {POLL_INTERVAL}s")
+    logger.info(f"  中文 DC: {CHINESE_DCS}")
+    logger.info(f"  通知开关: PC 通知({'开' if NOTIFY_PC else '关'}) / 手机通知 Bark({'开' if NOTIFY_BARK else '关'})")
+    logger.info(f"  重复提醒: {'开' if REPEAT_NOTIFY else '关'}" +
+                (f"（同一条招募隔 {REPEAT_NOTIFY_MINUTES} 分钟再提醒）" if REPEAT_NOTIFY else ""))
+    logger.info(f"  详情 API: {'开启' if FETCH_DETAIL_SLOTS else '关闭'}")
+    logger.info(f"  已记录 {len(seen)} 条历史招募 ID")
+    logger.info("=" * 60)
+
+    # 首次启动时，先把当前所有已有的招募加入 seen（不通知旧招募）
+    if not seen:
+        logger.info("首次启动：初始化已有招募列表（不通知旧招募）...")
+        initial_listings = fetch_listings(DUTIES)
+        now = time.time()
+        for item in initial_listings:
+            dc = item.get("datacenter", "")
+            if dc in CHINESE_DCS:
+                seen[item.get("id")] = now
+        save_seen(seen)
+        logger.info(f"已记录 {len(initial_listings)} 条初始招募，开始监控新招募..."
+                    + ("（重复提醒开着：这些旧招募若还挂着，间隔到期后也会提醒）" if REPEAT_NOTIFY else ""))
+
+    # 轮询主循环
+    consecutive_errors = 0
+    max_consecutive_errors = 10
+
+    while True:
+        try:
+            listings = fetch_listings(DUTIES)
+            consecutive_errors = 0
+
+            new_found = []  # (item, is_repeat) 列表
+
+            for item in listings:
+                lid = item.get("id")
+                dc = item.get("datacenter", "")
+                desc = item.get("description", "") or ""
+
+                # 只关心中文 DC + 智能米检测；提醒过且未到间隔的跳过
+                if dc in CHINESE_DCS and is_rice_party(desc):
+                    now = time.time()
+                    if should_notify(lid, seen, now):
+                        new_found.append((item, lid in seen))
+                        seen[lid] = now
+
+            if new_found:
+                repeat_count = 0
+                for item, is_repeat in new_found:
+                    if is_repeat:
+                        repeat_count += 1
+                    # 获取详情（含 slots）
+                    detail = None
+                    if FETCH_DETAIL_SLOTS:
+                        detail = fetch_detail(item.get("id"))
+
+                    console_msg = format_listing_console(item, detail)
+                    notify_msg = format_listing_detail(item, detail)
+                    bark_title = item.get("duty", "")
+                    bark_body = format_bark_body(item)
+
+                    logger.info(console_msg)
+                    if is_repeat:
+                        logger.info("（重复提醒：这条招募已提醒过，间隔到期后再次提醒）")
+                    logger.info(f"--- 通知内容 ---\n{notify_msg}\n---")
+
+                    notify(f"发现老板队！({item.get('duty', '')})", notify_msg,
+                           bark_title=bark_title, bark_body=bark_body)
+
+                save_seen(seen)
+                logger.info(f"本轮提醒 {len(new_found)} 条老板队招募" +
+                            (f"（其中重复提醒 {repeat_count} 条）" if repeat_count else ""))
+
+            # 统计当前所有绝欧招募
+            total_cn = sum(1 for l in listings if l.get("datacenter", "") in CHINESE_DCS)
+            rice_cn = sum(1 for l in listings
+                         if l.get("datacenter", "") in CHINESE_DCS
+                         and is_rice_party(l.get("description", "") or ""))
+            logger.info(f"当前绝欧招募: {len(listings)} 条 (中文DC {total_cn} 条, 其中老板队 {rice_cn} 条)")
+
+        except KeyboardInterrupt:
+            logger.info("用户中断，退出监控")
+            save_seen(seen)
+            break
+        except Exception as e:
+            consecutive_errors += 1
+            logger.error(f"监控异常: {e}")
+            if consecutive_errors >= max_consecutive_errors:
+                logger.critical(f"连续失败 {max_consecutive_errors} 次，等待 5 分钟后重试...")
+                time.sleep(300)
+                consecutive_errors = 0
+                continue
+
+        time.sleep(POLL_INTERVAL)
+
+
+if __name__ == "__main__":
+    main()

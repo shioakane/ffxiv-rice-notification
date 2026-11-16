@@ -1,0 +1,7 @@
+# 本地运行产生的文件，不进仓库
+__pycache__/
+*.pyc
+monitor.log
+seen_listings.json
+# Bark key（三种填法之一）：新建 bark.key 只写一行 key；该文件绝不提交
+bark.key
