@@ -63,8 +63,8 @@ JOB_MAP = {
 ROLE_MAP = {0: "自由", 1: "T", 2: "奶", 3: "DPS"}
 
 
-# ========== "米"检测逻辑（v2.5，2026-11-21 第六批样本外验证复测，来源见 rice_regex/v2_5.py） ==========
-STRONG_V5 = [
+# ========== "米"检测逻辑（v2.6，2026-11-22 第七批样本外验证复测，来源见 rice_regex/v2_6.py） ==========
+STRONG_V6 = [
     # v2.4: 时薪/小時薪/每小时/每小時 从强关键词移除（P1：拿着三百万时薪吐槽、1k2时薪跪下请安
     # 是裸词提及，非招募；时薪信号改由 HOURLY 的数字分支承担：N时薪 / 时薪N / 每小时N。
     # 三批 52807/72280/79370 的搞转时薪仍由 搞转/过立结/价格兜底，全五批验证无回归。）
@@ -73,7 +73,6 @@ STRONG_V5 = [
     "过本结", "过立结", "过本結", "過本結", "搞转", "搞轉",
     "郭立姐", "郭丽姐", "郭立姊", "郭立杰",
     "搞扣", "搞赔", "搞賠",
-    "代打", "代练", "代練",
     "立结",
     "低保", "底薪",
 ]
@@ -115,7 +114,7 @@ PRICE_UNTIL = re.compile(r'(?<![:：\d])[1-9]\d{1,3}\s*[W万萬K千]?\s*打到\s
 #  - /h 类分支前瞻 (?![0-9]) -> (?![1-4](?![0-9]))：H 后跟 5-9/多位数/字母仍是时薪，只有 H1-H4 职业码被挡
 #  - 新增 打满 X 小时（3200w打满两小时）、俩小时（600w俩小时）、每 h（400w每h）、
 #    w 时（1400w时，要求带 w，防 1000时=14:00）、/时（1200/时）、/30min（500/30min）
-HOURLY_V5 = re.compile(
+HOURLY_V6 = re.compile(
     r'(\d{1,4})\s*[wW万萬kK千]?\s*/\s*(?:[hH](?![1-4](?![0-9]))|小时|小時)'   # 1000/h, 800/h 6p
     r'|(\d{1,4})\s*[wW万萬kK千]?\s*/\s*1\s*(?:小时|小時)'                    # 400W/1小时
     r'|(\d{1,4})\s*[wW万萬kK千]?\s*/\s*1\s*[hH](?![1-4](?![0-9]))'           # 1000/1h
@@ -141,18 +140,18 @@ HOURLY_V5 = re.compile(
     r'|(\d{3,4})\s*半(?:小时|小時)'                                          # v2.4: 500半小时（裸数字+半小时）
 )
 # 人数拆分：要求前后不是数字/= /pP（排除 P2P3 阶段、7=1+P2 合并）；在未去空格原文上匹配
-SPLIT_V5 = re.compile(r'(?<![\d=pP])[1-7][pP][1-7](?![\d])')
+SPLIT_V6 = re.compile(r'(?<![\d=pP])[1-7][pP][1-7](?![\d])')
 # 价格+次数：要求带单位，或首数字>=100；v2.2：价格支持小数，须 >0
 # v2.5: 数字前不得紧贴字母/数字（去空格粘连：H2 20+ 不再拼成 H220+10；全五批验证无 TP 依赖字母前数字），
 # 但 3+ 大写字母策略码（YMD/MGL/TUUF 等）后的数字不是职业码粘连（YMD300+1 是价+人数）
-PRICE_PLUS_RUN_V5 = re.compile(r'(?:^|[^0-9A-Za-z:]|(?<=[A-Z]{3}))(\d{1,4}(?:\.\d{1,2})?)\s*([kK千]?[wW万萬]?)\s*[+＋]\s*(\d{1,2})(?:把|次|局)?')
-CLEAR_V5 = ["过本", "過本", "渡劫", "通关", "通關", "包过", "包過", "复建"]
+PRICE_PLUS_RUN_V6 = re.compile(r'(?:^|[^0-9A-Za-z:]|(?<=[A-Z]{3}))(\d{1,4}(?:\.\d{1,2})?)\s*([kK千]?[wW万萬]?)\s*(?:[+＋]|加)\s*(\d{1,2})(?:把|次|局)?')  # v2.6: 加 作分隔符（800加1；3加50 受 ≥100/单位门控保护）
+CLEAR_V6 = ["过本", "過本", "渡劫", "通关", "通關", "包过", "包過", "复建"]
 # v2.2: 全黑 从强关键词降级到此（组合词：需价格配合）
 BOSS_WORDS = ["老板", "老闆", "打工", "躺", "老板队", "老闆隊", "老板刷", "全黑"]
 HIRE_WORDS = ["陪练", "陪練", "傭兵", "佣兵", "代打", "代练", "代練", "代班"]
 DEDUCT_STRONG = ["搞扣", "搞赔", "搞賠"]
 DEDUCT_CTX = ["扣工资", "扣錢", "扣钱", "赔钱", "賠錢"]
-STAGE_DEDUCT_V5 = re.compile(
+STAGE_DEDUCT_V6 = re.compile(
     r'(?:[pP]?\s*)?([1-9])\s*[kK扣]\s*(?:[pP]?\s*)?([1-9])\s*[pP赔賠](?!\s*/\s*[cC][dD])'
     r'|(?:[pP]\s*)?([1-9])\s*扣\s*(?:[pP]\s*)?([1-9])\s*赔')
 REQ_STRIP = [
@@ -165,7 +164,7 @@ REQ_STRIP = [
 RANT_SENSITIVE = ["低保", "底薪", "时薪", "小時薪", "時薪", "每小时", "每小時"]
 RANT_RE = re.compile(r'骗[^，,。]{0,8}?(不给|不給)')
 # v2.2: 嘲讽标记（还寄吧 500w+1 穷逼开什么队 是嘲讽帖，非招募）
-RANT_MOCK = ["穷逼", "寄吧", "开什么队", "避雷", "挂人", "不会吧"]  # v2.4: 避雷/挂人帖（76684）；v2.5: 不会吧不会吧讽刺模板（14822/15611）
+RANT_MOCK = ["穷逼", "寄吧", "开什么队", "避雷", "挂人", "不会吧", "神人", "查清楚", "歉占"]  # v2.4: 避雷/挂人帖（76684）；v2.5: 不会吧不会吧讽刺模板（14822/15611）；v2.6: 神人/查清楚（没钱开100+1的神人嘲讽帖）、歉占（歉占问价帖，道歉语境）
 
 def _norm(desc):
     return unicodedata.normalize('NFKC', desc or '')
@@ -176,6 +175,8 @@ def _has_rant(raw):
     if "不想活了" in t or "藏亲友" in t: return True
     if any(m in t for m in RANT_MOCK): return True
     if RANT_RE.search(t): return True
+    # v2.6: “喜欢…就去…”引流嘲讽模板（200+1 喜欢摘棉花就去100+1，非招募；全库仅 3 处，均在第七批 FP 里）
+    if re.search(r'喜欢[^，,。]{0,12}就去', t): return True
     # v2.5: 低保/底薪/时薪类 + 吗 问句（能获得低保吗、时薪多少钱吗）是提问不是招募
     if re.search(r'(低保|底薪|时薪|小時薪|時薪|每小时|每小時).{0,6}吗', t): return True
     return False
@@ -183,7 +184,7 @@ def _has_rant(raw):
 def _has_price_unit(text):
     return bool(PRICE_UNIT.search(text))
 def _has_price_plus_run(text):
-    m = PRICE_PLUS_RUN_V5.search(text)
+    m = PRICE_PLUS_RUN_V6.search(text)
     if not m: return False
     num, unit = float(m.group(1)), m.group(2)
     return num > 0 and (bool(unit) or num >= 100)
@@ -202,14 +203,14 @@ def _bare_num(win):
     return False
 # v2.4: 雇佣窗口 16 -> 28（3238：招h1陪练…打半个小时，400w，价在 27 字外；
 # 6896：9-11點 70萬，先剔时间段再取窗口）。窗口内先去掉电话/QQ 长串与时间段。
-HIRE_WINDOW_V5 = 28
+HIRE_WINDOW_V6 = 28
 def _hire_with_price(raw):
     t = _flat(raw)
     for pat in TIME_STRIP: t = pat.sub('', t)
     t = _strip_time_ranges(t)
     for w in HIRE_WORDS:
         for m in re.finditer(re.escape(w), t):
-            lo, hi = max(0, m.start()-HIRE_WINDOW_V5), m.end()+HIRE_WINDOW_V5
+            lo, hi = max(0, m.start()-HIRE_WINDOW_V6), m.end()+HIRE_WINDOW_V6
             win = t[lo:hi]
             if (PRICE_UNIT.search(win) or PRICE_PER_CD.search(win) or PRICE_PER_MEAL.search(win)
                     or _bare_num(win) or re.search(r'[1-9]\d*\s*/\s*(?:飯|CD|小时|小時)', win)
@@ -218,14 +219,19 @@ def _hire_with_price(raw):
     return False
 def _short_hire_with_price(raw):
     t = _flat(raw)
-    return bool(re.search(r'\d{3,4}\s*陪(?![练練])', t))
+    if re.search(r'\d{3,4}\s*陪(?![练練])', t): return True
+    # v2.6: Nh + 招/找/来 + 职业 + 陪简写（400h招d3陪；全库 5 处 Nh…陪，4 处已是 TP，仅 21414 新命中）
+    return bool(re.search(r'\d{3,4}\s*[hH]\s*(?:招|找|来)\s*(?:非\w{0,3}[dD]\d|[dD]\d|H\d|MT|ST)?\s*陪(?![练練])', t))
 def _hire_negotiable(raw):
     t = _flat(raw)
     # v2.4: 进队谈价也是议价（71562 价格进队谈；80105 价不对进队说）
-    return any(w in t for w in HIRE_WORDS) and bool(re.search(r'价格(?:可议|可談|可谈|面议|详谈|进队(?:谈|说))|价不对进队(?:说|谈)', t))
+    # v2.6: 带价来 = 价格可议（招D4陪练（带价来）；全库仅 1 处）
+    return any(w in t for w in HIRE_WORDS) and bool(re.search(r'带价|价格(?:可议|可談|可谈|面议|详谈|进队(?:谈|说))|价不对进队(?:说|谈)', t))
 def _dog_with_price(raw):
     # v2.2: 先去掉 QQ/电话等 7 位以上长串，避免 ±10 字窗口把 792061652 截断成 7920 当价格
     t = re.sub(r'\d{7,}', '', _flat(raw))
+    # v2.6: 狗摇是机制词，其后数字不是价格（狗摇533；全库 15 处狗摇+数字，0 条 TP）
+    t = re.sub(r'狗摇\s*\d+', '狗摇', t)
     if re.search(r'狗\s*[+＋]\s*\d+', t): return True
     for m in re.finditer('狗', t):
         lo, hi = max(0, m.start()-10), m.end()+10
@@ -303,10 +309,11 @@ def _price_recruit(raw):
     t2 = re.sub(r'\d{1,2}\s*\+', '', t2)  # v2.4: 8+ / 10+ 类进度标记（300w 8+ st、350w 来10+）
     # 单位价 + 招/来/找 + 职业，中间允许 ≤12 字间隔（2kw，9-11，p4开荒来h2）
     # v2.5: 动词组加 招募（招募d4、招募个d1）
-    if re.search(price + r'\s*.{0,12}?(?:来|招募|招|找)\s*(?:一|1)?\s*(?:个|位)?\s*' + job, t2):
+    # v2.6: 动词组加 寻（寻d3，800w；见头注安全核查）
+    if re.search(price + r'\s*.{0,12}?(?:来|招募|招|找|寻)\s*(?:一|1)?\s*(?:个|位)?\s*' + job, t2):
         return True
     # 裸价 + 招/来 + 职业（3000招一H2）；裸数字读作时间时除外（1800招非黑d1）
-    m = re.search(r'(\d{3,4})\s*(?:来|招募|招)\s*(?:一|1)?\s*(?:个|位)?\s*' + job, t2)
+    m = re.search(r'(\d{3,4})\s*(?:来|招募|招|寻)\s*(?:一|1)?\s*(?:个|位)?\s*' + job, t2)
     if m and not _looks_like_time(m.group(1)):
         return True
     # v2.2: 裸价 + 找 + 职业（1600找非镰d2）；找 不受时间排除（全三批仅此一例，招/来仍受排除）
@@ -315,7 +322,7 @@ def _price_recruit(raw):
     # 尾价——招/来/找 + 职业 … 价格在后（来个D4 1600W）
     # v2.5: 动词组加 招募；动词后允 ≤4 字修饰（招硬硬的MT、来8加D1、招新H1）；
     # 职业与价格之间允 [pP]\d 进度码（进度p5、P2近U）
-    if re.search(r'(?:来|招募|招|找)\s*(?:一|1)?\s*(?:个|位)?\s*(?:\S{0,4}?\s*)?' + job + r'(?:[^\d]|[pP]\d){0,20}?\d{1,4}(?:\.\d{1,2})?\s*(?:[kK千]?[wW万萬]|[kK千])', t2):
+    if re.search(r'(?:来|招募|招|找|寻)\s*(?:一|1)?\s*(?:个|位)?\s*(?:\S{0,4}?\s*)?' + job + r'(?:[^\d]|[pP]\d){0,20}?\d{1,4}(?:\.\d{1,2})?\s*(?:[kK千]?[wW万萬]|[kK千])', t2):
         return True
     # v2.2: 价 … 职业（300w，+1，ymd，武士d1；价在前、中间隔 +1/ymd/职业名，≤10 字无数字）
     if re.search(price + r'\s*[^\d]{0,10}?(?:D\d|H\d|MT|ST)', t2):
@@ -334,10 +341,18 @@ def is_rice_party(desc):
     # v2.4: 反向要钱 / 讽刺语境不是老板队（v我50、赔老板；全 4945 条数据里各只出现 1 次，均在第四批 FP 里）
     if re.search(r'V\s*我\s*\d+', text): return False
     if re.search(r'(?<![\d扣搞])[赔賠]老板', text): return False  # v2.4: 赔前是数字/扣/搞时是扣赔机制（如 5扣6赔老板d1），不是反向付钱
+    # v2.6: 反向给钱不是老板队（打工倒给老板300w时；全库仅 1 处）
+    if '倒给' in text: return False
     # v2.5: 问是不是老板队（确定是老板队吗）是提问/抱怨，不是招募
     if re.search(r'是老板队[吗嘛]', text): return False
     rant = _has_rant(raw)
-    strong_hits = [k for k in STRONG_V5 if k.upper() in text]
+    # v2.6: 金币是 gil（约等于零），不是价格；全文只有金币、没有真实价格信号时不是老板队
+    # （5金币 躺黑 打工搞扣…；全库 7 处含金币，0 条 TP）
+    if '金币' in text and not (_has_price_unit(text) or PRICE_PER_CD.search(_strip_time_ranges(text))
+            or PRICE_PER_MEAL.search(text) or PRICE_PER_CLEAR.search(text)
+            or HOURLY_V6.search(raw) or _has_price_plus_run(text)):
+        return False
+    strong_hits = [k for k in STRONG_V6 if k.upper() in text]
     if strong_hits:
         # v2.4: 问价语境下降权时薪类强关键词（想问一下，现在时薪多少钱）
         if _is_price_inquiry(text):
@@ -345,7 +360,7 @@ def is_rice_party(desc):
             strong_hits = [k for k in strong_hits if k not in ("躺黑", "老板躺", "老闆躺")]
         if strong_hits and not (rant and all(k in RANT_SENSITIVE for k in strong_hits)):
             return True
-    if HOURLY_V5.search(raw) and not rant: return True   # v2.2: 时薪在未去空格原文上匹配；v2.5: 吐槽语境下时薪不触发（不会吧不会吧 400W 时薪渡劫）
+    if HOURLY_V6.search(raw) and not rant: return True   # v2.2: 时薪在未去空格原文上匹配；v2.5: 吐槽语境下时薪不触发（不会吧不会吧 400W 时薪渡劫）
     if _hourly_bare_with_settlement(raw): return True   # v2.4: 裸 N时 + 结算锚点（300时 过本+100）
     # v2.4: 按 CD 价用剔除时间段后的文本（晚8-111cd 不再拼成 111CD）
     if PRICE_PER_CD.search(_strip_time_ranges(text)) or PRICE_PER_MEAL.search(text) or PRICE_PER_CLEAR.search(text): return True
@@ -358,10 +373,10 @@ def is_rice_party(desc):
     has_price = _has_price_unit(text)
     t2 = text
     for pat in REQ_STRIP: t2 = pat.sub('', t2)
-    has_clear = any(k.upper() in t2 for k in CLEAR_V5)
+    has_clear = any(k.upper() in t2 for k in CLEAR_V6)
     has_boss = any(k in text for k in BOSS_WORDS)
-    has_split = bool(SPLIT_V5.search(raw))
-    has_deduct = any(k.upper() in text for k in DEDUCT_STRONG) or bool(STAGE_DEDUCT_V5.search(text))
+    has_split = bool(SPLIT_V6.search(raw))
+    has_deduct = any(k.upper() in text for k in DEDUCT_STRONG) or bool(STAGE_DEDUCT_V6.search(text))
     has_deduct_ctx = any(k.upper() in text for k in DEDUCT_CTX)
     if _nonboss_settlement(raw): return True   # v2.4: 非老板+数字结算条款（非老板问题p5前33）
     if has_deduct: return True
@@ -372,7 +387,7 @@ def is_rice_party(desc):
     return False
 
 def get_rice_reason(desc: str) -> List[str]:
-    """返回匹配到的原因列表（v2.5 规则，用于日志展示，与 is_rice_party 同口径）。"""
+    """返回匹配到的原因列表（v2.6 规则，用于日志展示，与 is_rice_party 同口径）。"""
     if not desc:
         return []
     raw = _norm(desc)
@@ -382,14 +397,18 @@ def get_rice_reason(desc: str) -> List[str]:
     if re.search(r'(?<![\d扣搞])[赔賠]老板', text): return []
     # v2.5: 问是不是老板队直接排除，不报原因
     if re.search(r'是老板队[吗嘛]', text): return []
+    # v2.6: 反向给钱直接排除，不报原因（打工倒给老板300w时）
+    if '倒给' in text: return []
+    # v2.6: 只有金币、没有真实价格信号时直接排除，不报原因（5金币 躺黑…）
+    if '金币' in text and not (_has_price_unit(text) or PRICE_PER_CD.search(_strip_time_ranges(text)) or PRICE_PER_MEAL.search(text) or PRICE_PER_CLEAR.search(text) or HOURLY_V6.search(raw) or _has_price_plus_run(text)): return []
     reasons = []
-    strong_hits = [k for k in STRONG_V5 if k.upper() in text]
+    strong_hits = [k for k in STRONG_V6 if k.upper() in text]
     if strong_hits:
         if _is_price_inquiry(text):
             strong_hits = [k for k in strong_hits if k not in ("躺黑", "老板躺", "老闆躺")]
         if strong_hits and not (_has_rant(raw) and all(k in RANT_SENSITIVE for k in strong_hits)):
             reasons.append(f"强关键词={strong_hits}")
-    m = HOURLY_V5.search(raw)  # v2.2: 时薪在未去空格原文上匹配；v2.5: 吐槽语境下不触发
+    m = HOURLY_V6.search(raw)  # v2.2: 时薪在未去空格原文上匹配；v2.5: 吐槽语境下不触发
     if m and not _has_rant(raw):
         reasons.append(f"时薪={m.group()}")
     for name, pat in (("按CD", PRICE_PER_CD), ("按饭", PRICE_PER_MEAL), ("按通关", PRICE_PER_CLEAR)):
@@ -404,7 +423,7 @@ def get_rice_reason(desc: str) -> List[str]:
     if mm:
         reasons.append(f"价+打到={mm.group()}")
     if _has_price_plus_run(text) and not _has_rant(raw):  # v2.2: 吐槽语境下价格+次数不触发
-        reasons.append(f"价格+次数={PRICE_PLUS_RUN_V5.search(text).group()}")
+        reasons.append(f"价格+次数={PRICE_PLUS_RUN_V6.search(text).group()}")
     if _hire_with_price(raw):
         reasons.append("雇佣+价=陪练/佣兵/代打/代班+价格")
     if _short_hire_with_price(raw):
@@ -427,16 +446,16 @@ def get_rice_reason(desc: str) -> List[str]:
     t2 = text
     for pat in REQ_STRIP:
         t2 = pat.sub('', t2)
-    clear_hits = [k for k in CLEAR_V5 if k.upper() in t2]
+    clear_hits = [k for k in CLEAR_V6 if k.upper() in t2]
     if clear_hits:
         reasons.append(f"过本={clear_hits}")
     boss_hits = [k for k in BOSS_WORDS if k in text]
     if boss_hits:
         reasons.append(f"老板/打工={boss_hits}")
-    sm = SPLIT_V5.search(raw)  # 拆分在未去空格原文上匹配
+    sm = SPLIT_V6.search(raw)  # 拆分在未去空格原文上匹配
     if sm:
         reasons.append(f"人数拆分={sm.group()}")
-    if any(k.upper() in text for k in DEDUCT_STRONG) or STAGE_DEDUCT_V5.search(text):
+    if any(k.upper() in text for k in DEDUCT_STRONG) or STAGE_DEDUCT_V6.search(text):
         reasons.append("扣赔机制")
     return reasons
 
