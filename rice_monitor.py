@@ -60,8 +60,8 @@ JOB_MAP = {
 ROLE_MAP = {0: "自由", 1: "T", 2: "奶", 3: "DPS"}
 
 
-# ========== "米"检测逻辑（v3.1，2026-11-26 纯净队 carve-out + Nh 雇佣词 fix，来源见 rice_regex/v3_1.py） ==========
-REGEX_VERSION = "v3.1"
+# ========== "米"检测逻辑（v3.2，2026-11-26 裸 Nh/N时直接放行 + 时间剔除扩展 + Nwk时薪，来源见 rice_regex/v3_2.py） ==========
+REGEX_VERSION = "v3.2"
 STRONG_V3 = [
     # v2.4: 时薪/小時薪/每小时/每小時 从强关键词移除（P1：拿着三百万时薪吐槽、1k2时薪跪下请安
     # 是裸词提及，非招募；时薪信号改由 HOURLY 的数字分支承担：N时薪 / 时薪N / 每小时N。
@@ -288,6 +288,14 @@ TIME_RANGE_SIMPLE = re.compile(r'\d{1,2}\s*[-~～]\s*\d{1,2}(?=\s*(?:点|點|来
 TIME_RANGE_GLUED_CD = re.compile(r'\d{1,2}\s*[-~～]\s*\d{1,2}(?=\d\s*[cC][dD])')
 TIME_RANGE_HHMM = re.compile(r'(\d{3,4})\s*[-~～]\s*(\d{3,4})(?![wW万萬kK千])')
 TIME_RANGE_HM = re.compile(r'\d{1,2}:\d{2}\s*[-~～]\s*\d{1,2}:\d{2}')
+# v3.2: HH:MM 到/至 HH:MM 时间段（8:30到10:30；连字符版已有 TIME_RANGE_HM）
+TIME_RANGE_HM_TO = re.compile(r'\d{1,2}:\d{2}\s*(?:到|至|~|～)\s*\d{1,2}:\d{2}')
+# v3.2: 晚/夜 + 1-2 位 - 2-3 位（晚8-111，打错字的晚8-11；后不跟价格单位/数字，
+# 防 2000-3000w 这类价；探针证实 v3.1 里“晚8-111”会漏出 BARE_NUM=111）
+TIME_RANGE_LATE = re.compile(r'(?:晚|夜)\s*\d{1,2}\s*[-~～]\s*\d{2,3}(?![\dwW万萬kK千])')
+# v3.2: 单点钟点（21点/9点/9点半；只认 1-2 位，4 位数字+点如 2000点 不动；
+# (?<!\d) 防长串内截断；bare fallback 里 1-2 位本就不算价，此处是显式兜底）
+TIME_POINT = re.compile(r'(?<!\d)\d{1,2}\s*[点點](?:半)?(?!\d)')
 # v2.5: N点(半)-N点(半) 时间段（9点半-11点半、9点-11点）；须两边都是合法钟点才剔（防 2000点-3000点 这类数字）
 TIME_RANGE_HM2 = re.compile(r'(\d{1,2})\s*(?:点|點)\s*半?\s*[-~～]\s*(\d{1,2})\s*(?:点|點)\s*半?')
 def _strip_time_ranges(t):
@@ -301,6 +309,9 @@ def _strip_time_ranges(t):
         return m.group(0)
     t = TIME_RANGE_HHMM.sub(_hhmm_repl, t)
     t = TIME_RANGE_HM.sub('', t)
+    t = TIME_RANGE_HM_TO.sub('', t)
+    t = TIME_RANGE_LATE.sub('', t)
+    t = TIME_POINT.sub('', t)
     return t
 # v2.4: 问价语境（想问一下/多少钱，且无招募动作+职业）不是招募
 INQUIRY_RE = re.compile(r'想问|问一下|问下|多少钱|怎么收费|什么价格|什么价')
@@ -393,13 +404,28 @@ CASH_RE = re.compile(
     r'|[1-9]\d{0,3}(?:\.\d{1,2})?\s*元'
     r'|¥\s*[1-9]\d{0,3}(?:\.\d{1,2})?')
 
+# v3.2: “1wk时薪”窄口径（1wk 是发帖人打错字；只对 wk + 小时语境放松字母守卫，
+# 简单才留）。在 _price_hit 的结构化循环里用（t 已大写，故 WK）。
+NWK_HOURLY_RE = re.compile(r'[1-9]\d{0,3}\s*WK\s*(?:时薪|時薪|小時薪|时|時)(?!间|間|候)')
+
+def _hourly_bare_price(raw):
+    """v3.2: 裸 Nh/N时直接算价格（用户 2026-11-26 晚裁决，取代原 v3.2 方案的
+    28 字窗口语境规则）。1 级已经过滤掉大半问题，2 级只需要能定位到明确的报价
+    数字就全部放行。Nh \\d{3,4}，N时 \\d{3,4}（用户 2026-11-26 20:00 裁决：时用
+    \\d{3,4}，2 位数钟点如“21时”不得放行；27 条里的 N时 全是 3-4 位数，覆盖没问题）；
+    含空格写法（900 h）亦可（_flat 去空格）。(?<!\\d) 防长串数字内截断（如
+    QQ 号 12345h 不应读出 2345h）。原“裸 600h/1000h 无语境仍排除”守卫已作废。"""
+    t = _flat(raw)
+    m = re.search(r'(?<!\d)(\d{3,4})\s*[hH]|(?<!\d)(\d{3,4})\s*时(?!间|候)', t)
+    return f'HOURLY_BARE={m.group()}' if m else None
+
 def _hourly_nh_with_hire(raw):
     """v3.1: 裸 Nh + 雇佣词 = 时薪（批 7 已确立规则“裸Nh + 雇佣词 = 时薪，无雇佣词时
     才是游戏时长”）。stage 2 的 fallback 里裸 Nh 一律当游戏时长排除是错的
     （主助手抽查发现：20913“500h 招d1陪练”被误 veto）。
     (a) _short_hire_with_price 的雇佣语境（Nh + 招/找/来 + 职业 + 陪简写，或 Nh + 陪）；
     (b) Nh 在陪练/佣兵/代打/代班/代练前后 28 字内（复用 _hire_with_price 的窗口口径
-    HIRE_WINDOW_V3 = 28）。无雇佣词的 Nh（如 1000h 过立结、800h打一小时）仍是游戏时长。"""
+    HIRE_WINDOW_V3 = 28）。无雇佣词的 Nh（如 1000h 过立结、800h打一小时）仍是游戏时长——该假设已被 27 条真老板队证伪（见 v3.2）；裸 Nh/N时现由 _hourly_bare_price 直接放行，本函数保留作兼容。"""
     t = _flat(raw)
     if not re.search(r'\d{3,4}\s*[hH]', t):
         return False
@@ -425,6 +451,10 @@ def _price_hit(raw):
     HOURLY 各分支 / CASH_RE（r/糖/t/元/¥）/ wan 认万 / 中文数字（千/百/万组合）。
     数字文本用 NFKC + 大写、保留空格的 _norm 文本（v2.7 教训：涉及数字边界的规则
     须在保留空格的文本上匹配，去空格粘连会误伤 D2 1000 / 300W ST / 70萬D3 / 800w p5）。
+    v3.2 新增：裸 Nh/N时直接算价格（_hourly_bare_price，用户裁决；N时 \\d{3,4}，
+    2 位数钟点“21时”不得放行）与 Nwk时薪窄口径（NWK_HOURLY_RE，只对 wk + 小时语境
+    放松字母守卫）；时间剔除扩展（_strip_time_ranges 新增 TIME_RANGE_HM_TO /
+    TIME_RANGE_LATE / TIME_POINT，单点 HH:MM 由 TIME_STRIP 整段去掉、不会留下 2100）。
     """
     raw = _norm(raw)
     t = raw.upper()          # NFKC + 大写，保留空格
@@ -443,12 +473,18 @@ def _price_hit(raw):
         ('PRICE_PER_MEAL', PRICE_PER_MEAL, t),
         ('HOURLY', HOURLY_V3, raw),
         ('CASH', CASH_RE, t),
+        ('HOURLY_WK', NWK_HOURLY_RE, t),
     ):
         m = pat.search(txt)
         if m:
             return f'{name}={m.group()}'
     # 2. 中文数字（只做招募里常见的 千/百/万 组合，不搞全量中文数字解析）
     hit = _chinese_number_hit(t)
+    if hit:
+        return hit
+    # v3.2: 裸 Nh/N时直接算价格（用户裁决，见文件头）：新规则先行、覆盖下面
+    # 的 _hourly_nh_with_hire（后者保留作兼容）。
+    hit = _hourly_bare_price(raw)
     if hit:
         return hit
     # v3.1: 裸 Nh + 雇佣词 = 时薪（批 7 规则）：Nh 是陪练的时薪价格
@@ -643,7 +679,7 @@ def _is_rice_party_stage1(desc):
     return False
 
 def get_rice_reason(desc: str) -> List[str]:
-    """返回匹配到的原因列表（v3.1 规则，1 级原因，用于日志展示，与 is_rice_party 的 stage 1 同口径）。"""
+    """返回匹配到的原因列表（v3.2 规则，1 级原因，用于日志展示，与 is_rice_party 的 stage 1 同口径）。"""
     if not desc:
         return []
     raw = _norm(desc)
@@ -728,7 +764,7 @@ def get_rice_reason(desc: str) -> List[str]:
         reasons.append("扣赔机制")
     return reasons
 
-# ========== 本地复核日志（v3.1） ==========
+# ========== 本地复核日志（v3.2） ==========
 # 记录两类事件：(a) 1 级正则判定为老板队的条目；(b) 2 级打回的条目。
 # 每条记录时间、id、文本、1 级原因、2 级判定。日志文件按天切分
 # （安装目录下 logs/review-YYYY-MM-DD.log，JSON Lines），最多保留 7 天；
@@ -1006,7 +1042,7 @@ def main():
                 dc = item.get("datacenter", "")
                 desc = item.get("description", "") or ""
 
-                # 只关心中文 DC + 智能米检测（v3.1 两级判定）
+                # 只关心中文 DC + 智能米检测（v3.2 两级判定）
                 if dc in CHINESE_DCS:
                     s1, s2, _price_hit = rice_stages(desc)
                     if s1 and s2:
