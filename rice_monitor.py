@@ -29,9 +29,6 @@ from config import (
     USER_AGENT, CHINESE_DCS,
     SEEN_FILE, LOG_FILE, PLAY_SOUND,
     FETCH_DETAIL_SLOTS,
-    BARK_GROUP, BARK_SOUND, BARK_RETRY,
-    NOTIFY_BARK, NOTIFY_PC,
-    REPEAT_NOTIFY, REPEAT_NOTIFY_MINUTES,
 )
 
 # ========== 日志配置 ==========
@@ -63,8 +60,8 @@ JOB_MAP = {
 ROLE_MAP = {0: "自由", 1: "T", 2: "奶", 3: "DPS"}
 
 
-# ========== "米"检测逻辑（v3.0，2026-11-26 定版二级过滤，来源见 rice_regex/v3_0.py） ==========
-REGEX_VERSION = "v3.0"
+# ========== "米"检测逻辑（v3.1，2026-11-26 纯净队 carve-out + Nh 雇佣词 fix，来源见 rice_regex/v3_1.py） ==========
+REGEX_VERSION = "v3.1"
 STRONG_V3 = [
     # v2.4: 时薪/小時薪/每小时/每小時 从强关键词移除（P1：拿着三百万时薪吐槽、1k2时薪跪下请安
     # 是裸词提及，非招募；时薪信号改由 HOURLY 的数字分支承担：N时薪 / 时薪N / 每小时N。
@@ -396,6 +393,25 @@ CASH_RE = re.compile(
     r'|[1-9]\d{0,3}(?:\.\d{1,2})?\s*元'
     r'|¥\s*[1-9]\d{0,3}(?:\.\d{1,2})?')
 
+def _hourly_nh_with_hire(raw):
+    """v3.1: 裸 Nh + 雇佣词 = 时薪（批 7 已确立规则“裸Nh + 雇佣词 = 时薪，无雇佣词时
+    才是游戏时长”）。stage 2 的 fallback 里裸 Nh 一律当游戏时长排除是错的
+    （主助手抽查发现：20913“500h 招d1陪练”被误 veto）。
+    (a) _short_hire_with_price 的雇佣语境（Nh + 招/找/来 + 职业 + 陪简写，或 Nh + 陪）；
+    (b) Nh 在陪练/佣兵/代打/代班/代练前后 28 字内（复用 _hire_with_price 的窗口口径
+    HIRE_WINDOW_V3 = 28）。无雇佣词的 Nh（如 1000h 过立结、800h打一小时）仍是游戏时长。"""
+    t = _flat(raw)
+    if not re.search(r'\d{3,4}\s*[hH]', t):
+        return False
+    if _short_hire_with_price(raw):
+        return True
+    for w in HIRE_WORDS:
+        for m in re.finditer(re.escape(w), t):
+            lo, hi = max(0, m.start() - HIRE_WINDOW_V3), m.end() + HIRE_WINDOW_V3
+            if re.search(r'\d{3,4}\s*[hH](?![A-Za-z0-9])', t[lo:hi]):
+                return True
+    return False
+
 def _price_hit(raw):
     """v3.0 stage 2：返回命中的数字价格字符串，无则返回 None。
 
@@ -412,6 +428,13 @@ def _price_hit(raw):
     """
     raw = _norm(raw)
     t = raw.upper()          # NFKC + 大写，保留空格
+    # v3.1: 纯净队 carve-out（用户定版，只查三个强关键词，没有别的格式）：
+    # 文本含 纯净/纯绿/无科技 任一词时直接放行（即使无价格数字）。纯净老板队极少
+    # 但通常是 2-3 倍报价。caveat：“非纯净”含“纯净”子串，九批中 4 行“非纯净”
+    # 全部 stage 1 命中 0，未受影响；若未来出现 stage 1 命中的“非纯净”行会被误放。
+    for _w in ('纯净', '纯绿', '无科技'):
+        if _w in t:
+            return f'PURE={_w}'
     t2 = _strip_time_ranges(t)
     # 1. 结构化价格格式（先查）
     for name, pat, txt in (
@@ -428,6 +451,9 @@ def _price_hit(raw):
     hit = _chinese_number_hit(t)
     if hit:
         return hit
+    # v3.1: 裸 Nh + 雇佣词 = 时薪（批 7 规则）：Nh 是陪练的时薪价格
+    if _hourly_nh_with_hire(raw):
+        return 'HOURLY_NH'
     # 3. 裸数字 fallback（时间段与长串已剔除的文本上找）
     t3 = t2
     for pat in TIME_STRIP:
@@ -538,7 +564,7 @@ def _has_price_stage2(raw):
     return _price_hit(raw) is not None
 
 def rice_stages(desc):
-    """v3.0 两级判定：返回 (stage1, stage2, stage2_price_hit)。
+    """v3.1 两级判定：返回 (stage1, stage2, stage2_price_hit)。
 
     stage1 = v2.9 判定；stage2 = 是否命中数字价格；stage2_price_hit 为命中的价格字符串
     （无则为 None）。供 rice_monitor.py 的本地日志挂钩使用；is_rice_party 即 stage1 and stage2。
@@ -617,7 +643,7 @@ def _is_rice_party_stage1(desc):
     return False
 
 def get_rice_reason(desc: str) -> List[str]:
-    """返回匹配到的原因列表（v3.0 规则，1 级原因，用于日志展示，与 is_rice_party 的 stage 1 同口径）。"""
+    """返回匹配到的原因列表（v3.1 规则，1 级原因，用于日志展示，与 is_rice_party 的 stage 1 同口径）。"""
     if not desc:
         return []
     raw = _norm(desc)
@@ -702,7 +728,7 @@ def get_rice_reason(desc: str) -> List[str]:
         reasons.append("扣赔机制")
     return reasons
 
-# ========== 本地复核日志（v3.0） ==========
+# ========== 本地复核日志（v3.1） ==========
 # 记录两类事件：(a) 1 级正则判定为老板队的条目；(b) 2 级打回的条目。
 # 每条记录时间、id、文本、1 级原因、2 级判定。日志文件按天切分
 # （安装目录下 logs/review-YYYY-MM-DD.log，JSON Lines），最多保留 7 天；
@@ -750,44 +776,23 @@ def log_review_event(lid, duty, desc, stage1_reasons, stage2_price_hit):
         pass
 
 # ========== 工具函数 ==========
-def load_seen() -> Dict[int, float]:
-    """加载已通知过的招募 ID -> 上次提醒时间（epoch 秒）。
-    兼容旧格式：旧版存的是纯 ID 列表，读到后按当前时间戳转换
-    （升级后旧招募会在间隔到期后才再次提醒，不会一启动就刷屏）。"""
+def load_seen() -> Set[int]:
+    """加载已通知过的招募 ID"""
     path = SCRIPT_DIR / SEEN_FILE
-    if not path.exists():
-        return {}
-    try:
-        data = json.loads(path.read_text(encoding="utf-8"))
-    except Exception as e:
-        logger.warning(f"读取 seen 文件失败: {e}，重新开始")
-        return {}
-    if isinstance(data, dict):
-        # 新格式 {id: 上次提醒时间}
-        return {int(k): float(v) for k, v in data.items()}
-    if isinstance(data, list):
-        # 旧格式 [id, id, ...]，按当前时间转换
-        now = time.time()
-        return {int(i): now for i in data}
-    return {}
+    if path.exists():
+        try:
+            return set(json.loads(path.read_text(encoding="utf-8")))
+        except Exception as e:
+            logger.warning(f"读取 seen 文件失败: {e}，重新开始")
+            return set()
+    return set()
 
 
-def save_seen(seen: Dict[int, float]):
-    """保存已通知过的招募 ID 及上次提醒时间（只保留最近提醒的 2000 个）"""
+def save_seen(seen: Set[int]):
+    """保存已通知过的招募 ID（只保留最近 2000 个）"""
     path = SCRIPT_DIR / SEEN_FILE
-    recent = dict(sorted(seen.items(), key=lambda kv: kv[1])[-2000:])
+    recent = sorted(seen)[-2000:]
     path.write_text(json.dumps(recent), encoding="utf-8")
-
-
-def should_notify(lid: int, seen: Dict[int, float], now: float) -> bool:
-    """这条招募现在该不该提醒：没提醒过 → 提醒；提醒过且开关开了、
-    距上次提醒已超过 REPEAT_NOTIFY_MINUTES 分钟 → 再提醒一次。"""
-    last = seen.get(lid)
-    if last is None:
-        return True
-    if not REPEAT_NOTIFY:
-        return False
-    return (now - last) >= REPEAT_NOTIFY_MINUTES * 60
 
 
 def fetch_listings(duties: List[int]) -> List[Dict[str, Any]]:
@@ -854,29 +859,6 @@ def format_slots(slots: List[Dict]) -> str:
         parts.append(f"招: {', '.join(open_slots)}")
 
     return " | ".join(parts) if parts else "（无 slots 信息）"
-
-
-def format_bark_body(item: Dict[str, Any]) -> str:
-    """手机推送正文（三行，短格式）：
-    第 1 行：描述
-    第 2 行：大区-队长@服务器 人数
-    第 3 行：接收时间 + 剩余时间
-    """
-    dc = item.get("datacenter", "")
-    name = item.get("name", "")
-    home = item.get("home_world", "")
-    desc = (item.get("description", "") or "").strip()
-    slots_filled = item.get("slots_filled", 0)
-    slots_available = item.get("slots_available", 0)
-    time_left = item.get("time_left", 0)
-    mins_left = int(time_left / 60) if time_left else 0
-    received = datetime.now().strftime("%m-%d %H:%M")
-    lines = [
-        desc,
-        f"{dc}-{name}@{home} {slots_filled}/{slots_available}",
-        f"接收 {received}｜剩余约 {mins_left} 分钟",
-    ]
-    return "\n".join(lines)
 
 
 def format_listing_detail(item: Dict[str, Any], detail: Optional[Dict]) -> str:
@@ -958,48 +940,25 @@ def show_msgbox(title: str, message: str):
     t.start()
 
 
-def notify(title: str, message: str,
-           bark_title: Optional[str] = None, bark_body: Optional[str] = None):
-    """发送通知。PC 通知和手机通知是两个独立开关（config 里的 NOTIFY_PC / NOTIFY_BARK），
-    可多选。bark_title / bark_body 不传时，手机推送沿用 PC 版的标题和正文。"""
+def notify(title: str, message: str):
+    """发送通知（多级降级保证一定能看到）"""
     logger.info(f"通知: {title}")
+    # 播放提示音
+    play_alert_sound()
+    # MessageBox 弹窗（最可靠）
+    show_msgbox(title, message)
 
-    # ---- PC 通知：弹窗 + 提示音 + toast ----
-    if NOTIFY_PC:
-        # 播放提示音
-        play_alert_sound()
-        # MessageBox 弹窗（最可靠）
-        show_msgbox(title, message)
-
-        # 同时尝试 plyer toast（如果 Windows 通知中心开着就能看到）
-        try:
-            from plyer import notification as plyer_notif
-            plyer_notif.notify(
-                title=title,
-                message=message[:200],
-                app_name="FF14 Rice Monitor",
-                timeout=10,
-            )
-        except Exception:
-            pass
-
-    # ---- 手机通知：Bark 推送到 iPhone（电脑当 server，手机只做接收）----
-    if NOTIFY_BARK:
-        try:
-            from bark import push_bark, load_key
-            key = load_key()
-            if not key:
-                logger.warning("Bark 未配置 key，跳过手机推送（把 key 填到 config.py 的 BARK_KEY，或新建 bark.key 文件）")
-            else:
-                ok, resp = push_bark(key, bark_title or title, bark_body or message,
-                                     group=BARK_GROUP, sound=BARK_SOUND,
-                                     retries=BARK_RETRY)
-                if ok:
-                    logger.info(f"Bark 推送成功: {resp}")
-                else:
-                    logger.error(f"Bark 推送失败: {resp}")
-        except Exception as e:
-            logger.error(f"Bark 推送异常: {e}")
+    # 同时尝试 plyer toast（如果 Windows 通知中心开着就能看到）
+    try:
+        from plyer import notification as plyer_notif
+        plyer_notif.notify(
+            title=title,
+            message=message[:200],
+            app_name="FF14 Rice Monitor",
+            timeout=10,
+        )
+    except Exception:
+        pass
 
 
 # ========== 主循环 ==========
@@ -1012,9 +971,7 @@ def main():
     logger.info(f"  轮询间隔: {POLL_INTERVAL}s")
     logger.info(f"  正则版本: {REGEX_VERSION}")
     logger.info(f"  中文 DC: {CHINESE_DCS}")
-    logger.info(f"  通知开关: PC 通知({'开' if NOTIFY_PC else '关'}) / 手机通知 Bark({'开' if NOTIFY_BARK else '关'})")
-    logger.info(f"  重复提醒: {'开' if REPEAT_NOTIFY else '关'}" +
-                (f"（同一条招募隔 {REPEAT_NOTIFY_MINUTES} 分钟再提醒）" if REPEAT_NOTIFY else ""))
+    logger.info(f"  通知方式: MessageBox + 提示音 + plyer toast")
     logger.info(f"  详情 API: {'开启' if FETCH_DETAIL_SLOTS else '关闭'}")
     logger.info(f"  已记录 {len(seen)} 条历史招募 ID")
     logger.info("=" * 60)
@@ -1023,14 +980,12 @@ def main():
     if not seen:
         logger.info("首次启动：初始化已有招募列表（不通知旧招募）...")
         initial_listings = fetch_listings(DUTIES)
-        now = time.time()
         for item in initial_listings:
             dc = item.get("datacenter", "")
             if dc in CHINESE_DCS:
-                seen[item.get("id")] = now
+                seen.add(item.get("id"))
         save_seen(seen)
-        logger.info(f"已记录 {len(initial_listings)} 条初始招募，开始监控新招募..."
-                    + ("（重复提醒开着：这些旧招募若还挂着，间隔到期后也会提醒）" if REPEAT_NOTIFY else ""))
+        logger.info(f"已记录 {len(initial_listings)} 条初始招募，开始监控新招募...")
 
     # 轮询主循环
     consecutive_errors = 0
@@ -1041,33 +996,31 @@ def main():
             listings = fetch_listings(DUTIES)
             consecutive_errors = 0
 
-            new_found = []  # (item, is_repeat) 列表
+            new_found = []
 
             for item in listings:
                 lid = item.get("id")
+                if lid in seen:
+                    continue
+
                 dc = item.get("datacenter", "")
                 desc = item.get("description", "") or ""
 
-                # 只关心中文 DC + 智能米检测（v3.0 两级判定）；提醒过且未到间隔的跳过
+                # 只关心中文 DC + 智能米检测（v3.1 两级判定）
                 if dc in CHINESE_DCS:
                     s1, s2, _price_hit = rice_stages(desc)
                     if s1 and s2:
-                        now = time.time()
-                        if should_notify(lid, seen, now):
-                            new_found.append((item, lid in seen))
-                            seen[lid] = now
-                            # v3.0 本地复核日志：1 级命中（将通知）
-                            log_review_event(lid, item.get("duty", ""), desc, get_rice_reason(desc), _price_hit)
+                        new_found.append(item)
+                        seen.add(lid)
+                        # v3.0 本地复核日志：1 级命中（将通知）
+                        log_review_event(lid, item.get("duty", ""), desc, get_rice_reason(desc), _price_hit)
                     elif s1 and lid not in _logged_veto_ids:
                         # v3.0 本地复核日志：2 级打回（进程内去重，只记一次）
                         log_review_event(lid, item.get("duty", ""), desc, get_rice_reason(desc), _price_hit)
                         _logged_veto_ids.add(lid)
 
             if new_found:
-                repeat_count = 0
-                for item, is_repeat in new_found:
-                    if is_repeat:
-                        repeat_count += 1
+                for item in new_found:
                     # 获取详情（含 slots）
                     detail = None
                     if FETCH_DETAIL_SLOTS:
@@ -1075,20 +1028,14 @@ def main():
 
                     console_msg = format_listing_console(item, detail)
                     notify_msg = format_listing_detail(item, detail)
-                    bark_title = item.get("duty", "")
-                    bark_body = format_bark_body(item)
 
                     logger.info(console_msg)
-                    if is_repeat:
-                        logger.info("（重复提醒：这条招募已提醒过，间隔到期后再次提醒）")
                     logger.info(f"--- 通知内容 ---\n{notify_msg}\n---")
 
-                    notify(f"发现老板队！({item.get('duty', '')})", notify_msg,
-                           bark_title=bark_title, bark_body=bark_body)
+                    notify(f"发现老板队！({item.get('duty', '')})", notify_msg)
 
                 save_seen(seen)
-                logger.info(f"本轮提醒 {len(new_found)} 条老板队招募" +
-                            (f"（其中重复提醒 {repeat_count} 条）" if repeat_count else ""))
+                logger.info(f"本轮发现 {len(new_found)} 条新老板队招募")
 
             # 统计当前所有绝欧招募
             total_cn = sum(1 for l in listings if l.get("datacenter", "") in CHINESE_DCS)
